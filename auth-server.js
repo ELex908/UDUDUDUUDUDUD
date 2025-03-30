@@ -1,0 +1,154 @@
+const express = require('express');
+const admin = require('firebase-admin');
+const cors = require('cors');
+
+// Initialize Express
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+// Initialize Firebase
+let serviceAccount;
+try {
+    if (process.env.FIREBASE_CONFIG) {
+        serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
+    } else {
+        serviceAccount = require('./firebase-config.json');
+    }
+
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL: process.env.DATABASE_URL
+    });
+} catch (error) {
+    console.error('Firebase initialization error:', error);
+}
+
+// Simple home route
+app.get('/', (req, res) => {
+    res.send('Authentication server is running');
+});
+
+// Authentication endpoint
+app.post('/auth', async (req, res) => {
+    try {
+        const { key, hwid, appName = 'default' } = req.body;
+        
+        if (!key || !hwid) {
+            return res.status(400).json({ success: false, message: 'Key and HWID are required' });
+        }
+        
+        // Get key info from database
+        const keysRef = admin.database().ref('keys').child(key);
+        const keySnapshot = await keysRef.once('value');
+        
+        if (!keySnapshot.exists()) {
+            return res.status(404).json({ success: false, message: 'Invalid key' });
+        }
+        
+        const keyData = keySnapshot.val();
+        const now = new Date().getTime();
+        
+        // Check if key is valid
+        if (keyData.isBanned) {
+            return res.status(403).json({ success: false, message: 'Key is banned' });
+        }
+        
+        if (!keyData.isActive) {
+            return res.status(403).json({ success: false, message: 'Key is paused' });
+        }
+        
+        if (keyData.expiresAt < now) {
+            return res.status(403).json({ success: false, message: 'Key has expired' });
+        }
+        
+        // Check if application is active
+        const appsRef = admin.database().ref('applications').child(appName);
+        const appSnapshot = await appsRef.once('value');
+        
+        if (!appSnapshot.exists()) {
+            return res.status(404).json({ success: false, message: 'Application not found' });
+        }
+        
+        if (!appSnapshot.val().isActive) {
+            return res.status(403).json({ success: false, message: 'Application is currently disabled' });
+        }
+        
+        // Check HWID binding
+        if (keyData.hwid && keyData.hwid !== hwid) {
+            return res.status(403).json({ 
+                success: false, 
+                message: 'HWID mismatch. This key is bound to another device.' 
+            });
+        }
+        
+        // Update key with HWID if not set and update last used time
+        const updates = {
+            lastUsed: now
+        };
+        
+        if (!keyData.hwid) {
+            updates.hwid = hwid;
+        }
+        
+        await keysRef.update(updates);
+        
+        // Return success with user info
+        return res.json({
+            success: true,
+            message: 'Authentication successful',
+            username: keyData.username || 'User',
+            keyType: keyData.type,
+            expiresAt: keyData.expiresAt
+        });
+    } catch (error) {
+        console.error('Authentication error:', error);
+        return res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Heartbeat endpoint to keep session alive and verify key is still valid
+app.post('/heartbeat', async (req, res) => {
+    try {
+        const { key, hwid, appName = 'default' } = req.body;
+        
+        if (!key || !hwid) {
+            return res.status(400).json({ success: false, message: 'Key and HWID are required' });
+        }
+        
+        // Similar validation as auth endpoint
+        const keysRef = admin.database().ref('keys').child(key);
+        const keySnapshot = await keysRef.once('value');
+        
+        if (!keySnapshot.exists() || 
+            keySnapshot.val().isBanned || 
+            !keySnapshot.val().isActive || 
+            keySnapshot.val().expiresAt < Date.now() ||
+            (keySnapshot.val().hwid && keySnapshot.val().hwid !== hwid)) {
+            return res.status(403).json({ success: false, message: 'Session invalid' });
+        }
+        
+        // Check if application is still active
+        const appsRef = admin.database().ref('applications').child(appName);
+        const appSnapshot = await appsRef.once('value');
+        
+        if (!appSnapshot.exists() || !appSnapshot.val().isActive) {
+            return res.status(403).json({ success: false, message: 'Application disabled' });
+        }
+        
+        // Update last used time
+        await keysRef.update({ lastUsed: Date.now() });
+        
+        return res.json({ success: true });
+    } catch (error) {
+        console.error('Heartbeat error:', error);
+        return res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Start the server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Authentication server running on port ${PORT}`);
+});
+
