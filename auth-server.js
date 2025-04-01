@@ -62,6 +62,15 @@ app.post('/auth', async (req, res) => {
             return res.status(403).json({ success: false, message: 'Key has expired' });
         }
         
+        // Check if the key is being used with the correct application
+        const keyApplication = keyData.application || 'default';
+        if (keyApplication !== appName) {
+            return res.status(403).json({ 
+                success: false, 
+                message: `Login failed: This key is for ${keyApplication} application, not ${appName}` 
+            });
+        }
+        
         // Check if application is active
         const appsRef = admin.database().ref('applications').child(appName);
         const appSnapshot = await appsRef.once('value');
@@ -76,9 +85,9 @@ app.post('/auth', async (req, res) => {
         
         // Check HWID binding
         if (keyData.hwid && keyData.hwid !== hwid) {
-            return res.status(403).json({ 
-                success: false, 
-                message: 'HWID mismatch. This key is bound to another device.' 
+            return res.status(403).json({
+                success: false,
+                message: 'HWID mismatch. This key is bound to another device.'
             });
         }
         
@@ -126,6 +135,16 @@ app.post('/heartbeat', async (req, res) => {
             keySnapshot.val().expiresAt < Date.now() ||
             (keySnapshot.val().hwid && keySnapshot.val().hwid !== hwid)) {
             return res.status(403).json({ success: false, message: 'Session invalid' });
+        }
+        
+        // Check if the key is being used with the correct application
+        const keyData = keySnapshot.val();
+        const keyApplication = keyData.application || 'default';
+        if (keyApplication !== appName) {
+            return res.status(403).json({ 
+                success: false, 
+                message: `Session invalid: This key is for ${keyApplication} application, not ${appName}` 
+            });
         }
         
         // Check if application is still active
