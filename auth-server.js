@@ -58,10 +58,6 @@ app.post('/auth', async (req, res) => {
             return res.status(403).json({ success: false, message: 'Key is paused' });
         }
         
-        if (keyData.expiresAt < now) {
-            return res.status(403).json({ success: false, message: 'Key has expired' });
-        }
-        
         // Check if the key is being used with the correct application
         const keyApplication = keyData.application || 'default';
         if (keyApplication !== appName) {
@@ -100,6 +96,45 @@ app.post('/auth', async (req, res) => {
             updates.hwid = hwid;
         }
         
+        // If key hasn't been activated yet, set activation time and calculate expiration
+        let expiresAt = keyData.expiresAt;
+        if (!keyData.activated) {
+            // Calculate expiration based on the key type and current time
+            const keyType = keyData.type;
+            let duration;
+            
+            if (keyType === 'lifetime') {
+                duration = 10 * 365 * 24 * 60 * 60 * 1000; // 10 years
+            } else if (keyType === 'month') {
+                duration = 30 * 24 * 60 * 60 * 1000; // 30 days
+            } else if (keyType === 'week') {
+                duration = 7 * 24 * 60 * 60 * 1000; // 7 days
+            } else if (keyType === '3day') {
+                duration = 3 * 24 * 60 * 60 * 1000; // 3 days
+            } else if (keyType === 'day') {
+                duration = 24 * 60 * 60 * 1000; // 1 day
+            } else if (keyType === 'second') {
+                duration = 1000; // 1 second (for testing)
+            } else if (keyType.includes('days')) {
+                // Extract number of days from custom duration (e.g., "5 days")
+                const days = parseInt(keyType.split(' ')[0]);
+                duration = days * 24 * 60 * 60 * 1000;
+            } else {
+                // Default to 1 day if type is unknown
+                duration = 24 * 60 * 60 * 1000;
+            }
+            
+            expiresAt = now + duration;
+            updates.activated = true;
+            updates.activatedAt = now;
+            updates.expiresAt = expiresAt;
+        } else {
+            // If already activated, check if it's expired
+            if (keyData.expiresAt < now) {
+                return res.status(403).json({ success: false, message: 'Key has expired' });
+            }
+        }
+        
         await keysRef.update(updates);
         
         // Return success with user info
@@ -108,7 +143,7 @@ app.post('/auth', async (req, res) => {
             message: 'Authentication successful',
             username: keyData.username || 'User',
             keyType: keyData.type,
-            expiresAt: keyData.expiresAt
+            expiresAt: expiresAt
         });
     } catch (error) {
         console.error('Authentication error:', error);
@@ -131,14 +166,28 @@ app.post('/heartbeat', async (req, res) => {
         
         if (!keySnapshot.exists() || 
             keySnapshot.val().isBanned || 
-            !keySnapshot.val().isActive || 
-            keySnapshot.val().expiresAt < Date.now() ||
-            (keySnapshot.val().hwid && keySnapshot.val().hwid !== hwid)) {
+            !keySnapshot.val().isActive) {
             return res.status(403).json({ success: false, message: 'Session invalid' });
         }
         
-        // Check if the key is being used with the correct application
         const keyData = keySnapshot.val();
+        
+        // Check if key has been activated
+        if (!keyData.activated) {
+            return res.status(403).json({ success: false, message: 'Key not activated' });
+        }
+        
+        // Check if key has expired
+        if (keyData.expiresAt < Date.now()) {
+            return res.status(403).json({ success: false, message: 'Key has expired' });
+        }
+        
+        // Check if HWID matches
+        if (keyData.hwid && keyData.hwid !== hwid) {
+            return res.status(403).json({ success: false, message: 'HWID mismatch' });
+        }
+        
+        // Check if the key is being used with the correct application
         const keyApplication = keyData.application || 'default';
         if (keyApplication !== appName) {
             return res.status(403).json({ 
