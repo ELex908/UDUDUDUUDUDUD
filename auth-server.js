@@ -29,6 +29,46 @@ app.get('/', (req, res) => {
     res.send('Authentication server is running');
 });
 
+
+async function deleteExpiredKeys() {
+    try {
+        const keysRef = admin.database().ref('keys');
+        const snapshot = await keysRef.once('value');
+        const now = new Date().getTime();
+        const deletePromises = [];
+        
+        snapshot.forEach(childSnapshot => {
+            const key = childSnapshot.key;
+            const keyData = childSnapshot.val();
+            
+            // Only delete keys that have been activated and are expired
+            if (keyData.activated && keyData.expiresAt < now) {
+                console.log(`Deleting expired key: ${key}`);
+                deletePromises.push(keysRef.child(key).remove());
+                
+                // If we have application info, update the key count
+                if (keyData.application) {
+                    const appRef = admin.database().ref('applications').child(keyData.application);
+                    deletePromises.push(
+                        appRef.once('value').then(appSnapshot => {
+                            if (appSnapshot.exists()) {
+                                const appData = appSnapshot.val();
+                                const keyCount = Math.max(0, (appData.keyCount || 0) - 1);
+                                return appRef.update({ keyCount });
+                            }
+                        })
+                    );
+                }
+            }
+        });
+        
+        await Promise.all(deletePromises);
+        console.log(`Deleted ${deletePromises.length} expired keys`);
+    } catch (error) {
+        console.error('Error deleting expired keys:', error);
+    }
+}
+
 // Authentication endpoint
 app.post('/auth', async (req, res) => {
     try {
@@ -131,7 +171,20 @@ app.post('/auth', async (req, res) => {
         } else {
             // If already activated, check if it's expired
             if (keyData.expiresAt < now) {
-                return res.status(403).json({ success: false, message: 'Key has expired' });
+                // Delete the expired key
+                await keysRef.remove();
+                
+                // Update key count for the application
+                if (keyApplication) {
+                    const appRef = admin.database().ref('applications').child(keyApplication);
+                    const appData = (await appRef.once('value')).val();
+                    if (appData) {
+                        const keyCount = Math.max(0, (appData.keyCount || 0) - 1);
+                        await appRef.update({ keyCount });
+                    }
+                }
+                
+                return res.status(403).json({ success: false, message: 'Key has expired and has been removed' });
             }
         }
         
@@ -150,7 +203,6 @@ app.post('/auth', async (req, res) => {
         return res.status(500).json({ success: false, message: 'Server error' });
     }
 });
-
 // Heartbeat endpoint to keep session alive and verify key is still valid
 app.post('/heartbeat', async (req, res) => {
     try {
@@ -164,13 +216,15 @@ app.post('/heartbeat', async (req, res) => {
         const keysRef = admin.database().ref('keys').child(key);
         const keySnapshot = await keysRef.once('value');
         
-        if (!keySnapshot.exists() || 
-            keySnapshot.val().isBanned || 
-            !keySnapshot.val().isActive) {
+        if (!keySnapshot.exists()) {
             return res.status(403).json({ success: false, message: 'Session invalid' });
         }
         
         const keyData = keySnapshot.val();
+        
+        if (keyData.isBanned || !keyData.isActive) {
+            return res.status(403).json({ success: false, message: 'Session invalid' });
+        }
         
         // Check if key has been activated
         if (!keyData.activated) {
@@ -179,7 +233,21 @@ app.post('/heartbeat', async (req, res) => {
         
         // Check if key has expired
         if (keyData.expiresAt < Date.now()) {
-            return res.status(403).json({ success: false, message: 'Key has expired' });
+            // Delete the expired key
+            await keysRef.remove();
+            
+            // Update key count for the application
+            const keyApplication = keyData.application || 'default';
+            if (keyApplication) {
+                const appRef = admin.database().ref('applications').child(keyApplication);
+                const appData = (await appRef.once('value')).val();
+                if (appData) {
+                    const keyCount = Math.max(0, (appData.keyCount || 0) - 1);
+                    await appRef.update({ keyCount });
+                }
+            }
+            
+            return res.status(403).json({ success: false, message: 'Key has expired and has been removed' });
         }
         
         // Check if HWID matches
